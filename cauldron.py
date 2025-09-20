@@ -19,7 +19,7 @@ def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1,
     infill_percent: процент заполнения (0-100)
     infill_type: тип заполнения
     image_size: размер выходных изображений (ширина, высота)
-    solid_layers: количество слоев с полной заливкой в начале и конце
+    solid_layers: количество слоев с полной заливкой в начале, конце и для горизонтальных плоскостей
     """
     
     # Создаем директорию для выходных файлов, если её нет
@@ -69,6 +69,7 @@ def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1,
     print(f"Толщина слоя: {layer_height:.2f} единиц")
     print(f"Количество слоев: {num_slices}")
     print(f"Фактическая толщина слоя: {actual_layer_height:.4f} единиц")
+    print(f"Слои с полной заливкой: {solid_layers}")
     
     # Создаем словарь для хранения горизонтальных плоскостей
     horizontal_planes = defaultdict(list)
@@ -82,6 +83,9 @@ def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1,
             z_level = z_values[0]
             horizontal_planes[z_level].append(triangle)
     
+    # Создаем список Z-координат всех горизонтальных плоскостей
+    horizontal_z_levels = sorted(horizontal_planes.keys())
+    
     # Создание изображений для каждого среза
     for slice_index in range(num_slices):
         current_z = min_z + (slice_index * actual_layer_height)
@@ -94,14 +98,27 @@ def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1,
         mask_img = Image.new('1', image_size, 0)
         mask_draw = ImageDraw.Draw(mask_img)
         
+        # Определяем, нужно ли использовать полную заливку для этого слоя
+        use_full_infill = False
+        
+        # Проверяем, находится ли текущий слой близко к горизонтальной плоскости
+        for z_level in horizontal_z_levels:
+            if abs(current_z - z_level) <= solid_layers * actual_layer_height:
+                use_full_infill = True
+                break
+        
+        # Также используем полную заливку для первых и последних solid_layers слоев
+        if slice_index < solid_layers or slice_index >= num_slices - solid_layers:
+            use_full_infill = True
+        
         # Обрабатываем каждый треугольник
         for triangle in stl_mesh.vectors:
             # Проверяем, пересекает ли треугольник текущую плоскость Z
             z_values = triangle[:, 2]
             
-            # Особый случай: горизонтальная плоскость точно на уровне среза
-            if np.any(np.isclose(z_values, current_z, atol=1e-5)):
-                # Это горизонтальная плоскость на уровне среза
+            # Особый случай: горизонтальная плоскость точно на уровне среза или рядом
+            if np.any(np.isclose(z_values, current_z, atol=actual_layer_height/2)):
+                # Это горизонтальная плоскость на уровне среза или рядом
                 # Проецируем весь треугольник на плоскость
                 vertices_2d = triangle[:, :2]
                 
@@ -153,12 +170,12 @@ def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1,
                 # Заполняем маску
                 ImageDraw.floodfill(mask_img, (center_x_mask, center_y_mask), 1)
                 
-                # Определяем, нужно ли использовать полную заливку
+                # Определяем тип заполнения
                 current_infill_type = infill_type
                 current_infill_percent = infill_percent
                 
-                # Для первых и последних solid_layers слоев используем полную заливку
-                if slice_index < solid_layers or slice_index >= num_slices - solid_layers:
+                # Используем полную заливку, если это необходимо
+                if use_full_infill:
                     current_infill_type = "full"
                     current_infill_percent = 100
                     print(f"Слой {slice_index+1}/{num_slices} (полная заливка)")
