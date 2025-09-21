@@ -84,10 +84,18 @@ class OpenGLWidget(QGLWidget):
         self.zoom = 1.0
         self.lastPos = None
         self.display_list = None
+        self.table_size = 200.0
+        self.supports = []
+        self.show_supports = False
+        self.support_angle = 45.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self.is_panning = False
+        self.last_pan_pos = None
 
     def initializeGL(self):
         try:
-            glClearColor(0.0, 0.0, 0.0, 1.0)
+            glClearColor(0.2, 0.2, 0.2, 1.0)
             glEnable(GL_DEPTH_TEST)
             glEnable(GL_LIGHT0)
             glEnable(GL_LIGHTING)
@@ -123,10 +131,20 @@ class OpenGLWidget(QGLWidget):
         try:
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             glLoadIdentity()
-            glTranslatef(0.0, 0.0, -5.0 * self.zoom)
+            glTranslatef(self.pan_x, self.pan_y, -5.0 * self.zoom)
             glRotatef(self.xRot, 1.0, 0.0, 0.0)
             glRotatef(self.yRot, 0.0, 1.0, 0.0)
             glRotatef(self.zRot, 0.0, 0.0, 1.0)
+
+            # Рисуем плоскость стола
+            self.draw_table()
+            
+            # Рисуем оси координат
+            self.draw_axes()
+            
+            # Рисуем поддержки, если включено
+            if self.show_supports:
+                self.draw_supports()
 
             if self.mesh_vertices is not None and self.mesh_normals is not None:
                 glEnableClientState(GL_VERTEX_ARRAY)
@@ -142,6 +160,77 @@ class OpenGLWidget(QGLWidget):
         except Exception as e:
             print(f"OpenGL render error: {e}")
 
+    def draw_table(self):
+        """Рисует плоскость стола"""
+        glPushMatrix()
+        glColor3f(0.5, 0.5, 0.5)  # Серый цвет для стола
+        glTranslatef(0.0, 0.0, -self.table_size/2)  # Помещаем стол под модель
+        
+        # Рисуем сетку стола
+        glBegin(GL_LINES)
+        grid_size = self.table_size
+        step = grid_size / 10.0
+        
+        for i in range(-5, 6):
+            # Горизонтальные линии
+            glVertex3f(-grid_size/2, i * step, 0)
+            glVertex3f(grid_size/2, i * step, 0)
+            
+            # Вертикальные линии
+            glVertex3f(i * step, -grid_size/2, 0)
+            glVertex3f(i * step, grid_size/2, 0)
+        glEnd()
+        
+        glPopMatrix()
+
+    def draw_axes(self):
+        """Рисует оси координат"""
+        glPushMatrix()
+        glLineWidth(2.0)
+        
+        # Ось X (красная)
+        glColor3f(1.0, 0.0, 0.0)
+        glBegin(GL_LINES)
+        glVertex3f(0.0, 0.0, 0.0)
+        glVertex3f(self.table_size/4, 0.0, 0.0)
+        glEnd()
+        
+        # Ось Y (зеленая)
+        glColor3f(0.0, 1.0, 0.0)
+        glBegin(GL_LINES)
+        glVertex3f(0.0, 0.0, 0.0)
+        glVertex3f(0.0, self.table_size/4, 0.0)
+        glEnd()
+        
+        # Ось Z (синяя)
+        glColor3f(0.0, 0.0, 1.0)
+        glBegin(GL_LINES)
+        glVertex3f(0.0, 0.0, 0.0)
+        glVertex3f(0.0, 0.0, self.table_size/4)
+        glEnd()
+        
+        glLineWidth(1.0)
+        glPopMatrix()
+
+    def draw_supports(self):
+        """Рисует поддержки"""
+        if not self.supports:
+            return
+            
+        glPushMatrix()
+        glColor3f(1.0, 0.5, 0.0)  # Оранжевый цвет для поддержек
+        glLineWidth(2.0)
+        
+        glBegin(GL_LINES)
+        for support in self.supports:
+            start, end = support
+            glVertex3f(*start)
+            glVertex3f(*end)
+        glEnd()
+        
+        glLineWidth(1.0)
+        glPopMatrix()
+
     def setMeshData(self, vertices, normals):
         try:
             # Конвертируем данные в формат, понятный OpenGL
@@ -152,19 +241,47 @@ class OpenGLWidget(QGLWidget):
         except Exception as e:
             print(f"OpenGL set mesh data error: {e}")
 
+    def setSupports(self, supports):
+        """Устанавливает данные для отображения поддержек"""
+        self.supports = supports
+        self.update()
+
+    def setSupportVisibility(self, visible):
+        """Устанавливает видимость поддержек"""
+        self.show_supports = visible
+        self.update()
+
+    def setSupportAngle(self, angle):
+        """Устанавливает угол для генерации поддержек"""
+        self.support_angle = angle
+        self.update()
+
     def mousePressEvent(self, event):
-        self.lastPos = event.pos()
+        if event.button() == Qt.LeftButton:
+            self.lastPos = event.pos()
+        elif event.button() == Qt.RightButton:
+            self.is_panning = True
+            self.last_pan_pos = event.pos()
 
     def mouseMoveEvent(self, event):
-        dx = event.x() - self.lastPos.x()
-        dy = event.y() - self.lastPos.y()
-
         if event.buttons() & Qt.LeftButton:
+            dx = event.x() - self.lastPos.x()
+            dy = event.y() - self.lastPos.y()
             self.xRot += dy * 0.5
             self.yRot += dx * 0.5
             self.update()
+            self.lastPos = event.pos()
+        elif event.buttons() & Qt.RightButton and self.is_panning:
+            dx = event.x() - self.last_pan_pos.x()
+            dy = event.y() - self.last_pan_pos.y()
+            self.pan_x += dx * 0.01
+            self.pan_y -= dy * 0.01  # Инвертируем Y для естественного перемещения
+            self.update()
+            self.last_pan_pos = event.pos()
 
-        self.lastPos = event.pos()
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.is_panning = False
 
     def wheelEvent(self, event):
         delta = event.angleDelta().y() / 120
@@ -172,11 +289,26 @@ class OpenGLWidget(QGLWidget):
         self.zoom = max(0.1, min(self.zoom, 5.0))
         self.update()
 
+    def resetView(self):
+        """Сбрасывает вид к начальному состоянию"""
+        self.xRot = 0
+        self.yRot = 0
+        self.zRot = 0
+        self.zoom = 1.0
+        self.pan_x = 0
+        self.pan_y = 0
+        self.update()
+
 # Класс настроек трансформации модели
 class TransformSettings(QWidget):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
         self.initUI()
+        self.setupConnections()
+        self.transform_timer = QTimer()
+        self.transform_timer.setSingleShot(True)
+        self.transform_timer.timeout.connect(self.applyTransformations)
 
     def initUI(self):
         layout = QVBoxLayout()
@@ -253,12 +385,61 @@ class TransformSettings(QWidget):
         rotation_group.setLayout(rotation_layout)
         layout.addWidget(rotation_group)
 
-        # Кнопка применения трансформации
-        self.apply_btn = QPushButton("Применить трансформацию")
-        layout.addWidget(self.apply_btn)
+        # Кнопка сброса вида
+        self.reset_view_btn = QPushButton("Сбросить вид")
+        layout.addWidget(self.reset_view_btn)
 
         layout.addStretch()
         self.setLayout(layout)
+
+    def setupConnections(self):
+        """Настраивает автоматическое применение трансформаций"""
+        self.scale.valueChanged.connect(self.startTransformTimer)
+        self.x_pos.valueChanged.connect(self.startTransformTimer)
+        self.y_pos.valueChanged.connect(self.startTransformTimer)
+        self.z_pos.valueChanged.connect(self.startTransformTimer)
+        self.x_rot.valueChanged.connect(self.startTransformTimer)
+        self.y_rot.valueChanged.connect(self.startTransformTimer)
+        self.z_rot.valueChanged.connect(self.startTransformTimer)
+        self.reset_view_btn.clicked.connect(self.resetView)
+
+    def startTransformTimer(self):
+        """Запускает таймер для отложенного применения трансформаций"""
+        self.transform_timer.start(500)  # 500ms задержка
+
+    def applyTransformations(self):
+        """Автоматически применяет трансформации при изменении значений"""
+        if self.parent and self.parent.stl_mesh is not None:
+            try:
+                scale = self.scale.value()
+                rotation = (
+                    self.x_rot.value(),
+                    self.y_rot.value(),
+                    self.z_rot.value()
+                )
+                translation = (
+                    self.x_pos.value(),
+                    self.y_pos.value(),
+                    self.z_pos.value()
+                )
+                
+                transformed_mesh = self.parent.converter.apply_transformations(scale, rotation, translation)
+                
+                if transformed_mesh is not None:
+                    # Обновляем OpenGL виджет
+                    vertices, normals = self.parent.converter.get_opengl_data()
+                    if vertices is not None and normals is not None:
+                        self.parent.model_viewer.setMeshData(vertices, normals)
+                        
+                    # Пересчитываем поддержки
+                    self.parent.calculate_supports()
+            except Exception as e:
+                print(f"Error applying transformations: {e}")
+
+    def resetView(self):
+        """Сбрасывает вид 3D-модели"""
+        if self.parent:
+            self.parent.model_viewer.resetView()
 
 # Класс настроек слайсинга
 class SliceSettings(QWidget):
@@ -402,15 +583,21 @@ class FillSettings(QWidget):
 
 # Класс настроек поддержек
 class SupportSettings(QWidget):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent = parent
         self.initUI()
+        self.setupConnections()
+        self.support_timer = QTimer()
+        self.support_timer.setSingleShot(True)
+        self.support_timer.timeout.connect(self.updateSupports)
 
     def initUI(self):
         layout = QVBoxLayout()
 
         # Включение поддержек
         self.support_enable = QCheckBox("Включить поддержки")
+        self.support_enable.setChecked(False)
         layout.addWidget(self.support_enable)
 
         # Угол поддержек
@@ -441,6 +628,20 @@ class SupportSettings(QWidget):
 
         layout.addStretch()
         self.setLayout(layout)
+
+    def setupConnections(self):
+        """Настраивает автоматическое обновление поддержек"""
+        self.support_enable.stateChanged.connect(self.startSupportTimer)
+        self.support_angle.valueChanged.connect(self.startSupportTimer)
+
+    def startSupportTimer(self):
+        """Запускает таймер для отложенного обновления поддержек"""
+        self.support_timer.start(500)  # 500ms задержка
+
+    def updateSupports(self):
+        """Обновляет отображение поддержек"""
+        if self.parent and self.parent.stl_mesh is not None:
+            self.parent.calculate_supports()
 
 # Класс для работы с STL и преобразований
 class STLConverter:
@@ -790,8 +991,8 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
 
     def initUI(self):
-        self.setWindowTitle("STL to BMP Slicer")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle("WitchsCutter")
+        self.setGeometry(100, 100, 1400, 900)  # Увеличили размер окна
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -809,10 +1010,10 @@ class MainWindow(QMainWindow):
 
         # Настройки слайсинга
         self.tabs = QTabWidget()
-        self.transform_settings = TransformSettings()
+        self.transform_settings = TransformSettings(self)
         self.slice_settings = SliceSettings()
         self.fill_settings = FillSettings()
-        self.support_settings = SupportSettings()
+        self.support_settings = SupportSettings(self)
 
         self.tabs.addTab(self.transform_settings, "Трансформация")
         self.tabs.addTab(self.slice_settings, "Слайсинг")
@@ -826,12 +1027,9 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.progress_bar)
 
         # Кнопка генерации
-        self.generate_btn = QPushButton("Генерировать BMP")
+        self.generate_btn = QPushButton("Подготовить к печати")
         self.generate_btn.clicked.connect(self.generate_bmp)
         left_layout.addWidget(self.generate_btn)
-
-        # Кнопка применения трансформации
-        self.transform_settings.apply_btn.clicked.connect(self.apply_transformation)
 
         # Кнопка выбора папки сохранения
         self.slice_settings.browse_btn.clicked.connect(self.browse_save_path)
@@ -845,6 +1043,7 @@ class MainWindow(QMainWindow):
         
         # Визуализация 3D модели с помощью OpenGL
         self.model_viewer = OpenGLWidget(self)
+        self.model_viewer.setMinimumSize(600, 500)  # Увеличили размер 3D-вида
         right_layout.addWidget(self.model_viewer)
         
         # Превью слоя
@@ -913,43 +1112,53 @@ class MainWindow(QMainWindow):
             if vertices is not None and normals is not None:
                 self.model_viewer.setMeshData(vertices, normals)
             
-            self.preview.setText("Модель загружена. Нажмите 'Генерировать BMP' для создания слоев.")
+            # Рассчитываем поддержки
+            self.calculate_supports()
+            
+            self.preview.setText("Модель загружена. Нажмите 'Подготовить к печати' для создания слоев.")
             QMessageBox.information(self, "Успех", "STL файл успешно загружен")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить STL файл: {str(e)}")
 
-    def apply_transformation(self):
+    def calculate_supports(self):
+        """Вычисляет поддержки для текущей модели"""
         if self.stl_mesh is None:
-            QMessageBox.warning(self, "Ошибка", "Сначала загрузите STL файл")
             return
-
-        try:
-            scale = self.transform_settings.scale.value()
-            rotation = (
-                self.transform_settings.x_rot.value(),
-                self.transform_settings.y_rot.value(),
-                self.transform_settings.z_rot.value()
-            )
-            translation = (
-                self.transform_settings.x_pos.value(),
-                self.transform_settings.y_pos.value(),
-                self.transform_settings.z_pos.value()
-            )
             
-            transformed_mesh = self.converter.apply_transformations(scale, rotation, translation)
+        # Получаем настройки поддержек
+        support_enable = self.support_settings.support_enable.isChecked()
+        support_angle = self.support_settings.support_angle.value()
+        
+        if not support_enable:
+            self.model_viewer.setSupportVisibility(False)
+            return
             
-            if transformed_mesh is None:
-                QMessageBox.critical(self, "Ошибка", "Не удалось применить трансформации")
-                return
+        # Упрощенный алгоритм генерации поддержек
+        # В реальном приложении нужно использовать более сложный алгоритм
+        supports = []
+        
+        # Определяем границы модели
+        min_coords = np.min(self.converter.transformed_mesh.vectors, axis=(0, 1))
+        max_coords = np.max(self.converter.transformed_mesh.vectors, axis=(0, 1))
+        min_z = min_coords[2]
+        
+        # Для демонстрации генерируем простые вертикальные поддержки
+        # В реальном приложении нужно анализировать углы наклона поверхностей
+        for triangle in self.converter.transformed_mesh.vectors:
+            # Простая проверка: если треугольник близок к горизонтали и находится высоко, добавляем поддержку
+            z_values = triangle[:, 2]
+            avg_z = np.mean(z_values)
             
-            # Обновляем OpenGL виджет
-            vertices, normals = self.converter.get_opengl_data()
-            if vertices is not None and normals is not None:
-                self.model_viewer.setMeshData(vertices, normals)
+            # Если треугольник выше определенной высоты и достаточно горизонтален
+            if avg_z > min_z + (max_coords[2] - min_z) * 0.3:
+                # Находим центр треугольника
+                center = np.mean(triangle, axis=0)
                 
-            QMessageBox.information(self, "Успех", "Трансформация применена")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Ошибка при трансформации: {str(e)}")
+                # Создаем поддержку от центра треугольника до основания
+                supports.append((center, [center[0], center[1], min_z]))
+        
+        self.model_viewer.setSupports(supports)
+        self.model_viewer.setSupportVisibility(True)
 
     def browse_save_path(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения")
@@ -1026,7 +1235,7 @@ class MainWindow(QMainWindow):
                 self.layer_spin.setMaximum(len(layers)-1)
                 self.show_layer(0)
             
-            QMessageBox.information(self, "Успех", f"BMP файлы успешно сгенерированы и сохранены в {save_path}")
+            QMessageBox.information(self, "Успех", f"файлы успешно сгенерированы и сохранены в {save_path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Ошибка при сохранении: {str(e)}")
 
