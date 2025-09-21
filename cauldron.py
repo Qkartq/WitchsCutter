@@ -1,485 +1,695 @@
+import sys
+import os
 import numpy as np
 from stl import mesh
 from PIL import Image, ImageDraw
-import os
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                             QPushButton, QLabel, QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
+                             QCheckBox, QFileDialog, QGroupBox, QTabWidget, QMessageBox, QLineEdit,
+                             QSplitter, QSizePolicy, QTextEdit)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QPixmap, QImage
+import cv2
+from scipy.spatial import ConvexHull
+from skimage import morphology
+import matplotlib.pyplot as plt
+from mpl_toolkits import mplot3d
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import tempfile
 import math
-from collections import defaultdict
 
-def stl_to_bmp_slices(stl_file_path, output_dir, layer_height=0.1, 
-                     wall_thickness=1, infill_percent=20, infill_type="grid",
-                     image_size=(320, 240), solid_layers=5):
-    """
-    Конвертирует STL-файл в серию BMP-изображений (срезы)
-    
-    Параметры:
-    stl_file_path: путь к STL-файлу
-    output_dir: директория для сохранения BMP-файлов
-    layer_height: толщина слоя в единицах модели
-    wall_thickness: толщина стенки в пикселях
-    infill_percent: процент заполнения (0-100)
-    infill_type: тип заполнения
-    image_size: размер выходных изображений (ширина, высота)
-    solid_layers: количество слоев с полной заливкой в начале, конце и для горизонтальных плоскостей
-    """
-    
-    # Создаем директорию для выходных файлов, если её нет
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    # Загрузка STL-файла
-    stl_mesh = mesh.Mesh.from_file(stl_file_path)
-    
-    # Определение границ модели по всем осям
-    min_coords = np.min(stl_mesh.vectors, axis=(0, 1))
-    max_coords = np.max(stl_mesh.vectors, axis=(0, 1))
-    
-    min_x, min_y, min_z = min_coords
-    max_x, max_y, max_z = max_coords
-    
-    # Вычисляем высоту модели по оси Z
-    z_height = max_z - min_z
-    
-    # Вычисляем количество слоев на основе высоты модели и толщины слоя
-    num_slices = math.ceil(z_height / layer_height)
-    
-    # Вычисляем фактическую толщину слоя для равномерного распределения
-    actual_layer_height = z_height / num_slices
-    
-    # Вычисляем центр и размер модели в XY-плоскости
-    center_x = (min_x + max_x) / 2
-    center_y = (min_y + max_y) / 2
-    size_x = max_x - min_x
-    size_y = max_y - min_y
-    
-    # Определяем масштаб для сохранения пропорций
-    scale = min((image_size[0] * 0.9) / size_x, 
-                (image_size[1] * 0.9) / size_y)
-    
-    # Смещение для центрирования
-    offset_x = image_size[0] / 2 - center_x * scale
-    offset_y = image_size[1] / 2 - center_y * scale
-
-    # Функция для преобразования координат в пиксели
-    def to_pixel(x, y):
-        px = int(offset_x + x * scale)
-        py = int(offset_y - y * scale)  # Инвертируем Y для правильной ориентации
-        return (px, py)
-
-    print(f"Высота модели: {z_height:.2f} единиц")
-    print(f"Толщина слоя: {layer_height:.2f} единиц")
-    print(f"Количество слоев: {num_slices}")
-    print(f"Фактическая толщина слоя: {actual_layer_height:.4f} единиц")
-    print(f"Слои с полной заливкой: {solid_layers}")
-    
-    # Создаем словарь для хранения горизонтальных плоскостей
-    horizontal_planes = defaultdict(list)
-    
-    # Идентифицируем горизонтальные плоскости (крышки и дно)
-    for triangle in stl_mesh.vectors:
-        # Проверяем, является ли треугольник горизонтальным
-        z_values = triangle[:, 2]
-        if np.allclose(z_values, z_values[0], atol=1e-5):
-            # Это горизонтальная плоскость
-            z_level = z_values[0]
-            horizontal_planes[z_level].append(triangle)
-    
-    # Создаем список Z-координат всех горизонтальных плоскостей
-    horizontal_z_levels = sorted(horizontal_planes.keys())
-    
-    # Создание изображений для каждого среза
-    for slice_index in range(num_slices):
-        current_z = min_z + (slice_index * actual_layer_height)
+class ModelViewer(FigureCanvas):
+    def __init__(self, parent=None):
+        self.fig = plt.figure(figsize=(5, 5))
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.axes = self.fig.add_subplot(111, projection='3d')
+        self.axes.set_xlabel('X')
+        self.axes.set_ylabel('Y')
+        self.axes.set_zlabel('Z')
+        self.mesh_data = None
         
-        # Создаем изображение с черным фоном
-        img = Image.new('1', image_size, 0)
-        draw = ImageDraw.Draw(img)
+    def plot_mesh(self, stl_mesh, scale=1.0, rotation=(0, 0, 0), translation=(0, 0, 0)):
+        self.axes.clear()
         
-        # Создаем маску для заполнения
-        mask_img = Image.new('1', image_size, 0)
-        mask_draw = ImageDraw.Draw(mask_img)
-        
-        # Определяем, нужно ли использовать полную заливку для этого слоя
-        use_full_infill = False
-        
-        # Проверяем, находится ли текущий слой близко к горизонтальной плоскости
-        for z_level in horizontal_z_levels:
-            if abs(current_z - z_level) <= solid_layers * actual_layer_height:
-                use_full_infill = True
-                break
-        
-        # Также используем полную заливку для первых и последних solid_layers слоев
-        if slice_index < solid_layers or slice_index >= num_slices - solid_layers:
-            use_full_infill = True
-        
-        # Обрабатываем каждый треугольник
-        for triangle in stl_mesh.vectors:
-            # Проверяем, пересекает ли треугольник текущую плоскость Z
-            z_values = triangle[:, 2]
+        if stl_mesh is None:
+            self.draw()
+            return
             
-            # Особый случай: горизонтальная плоскость точно на уровне среза или рядом
-            if np.any(np.isclose(z_values, current_z, atol=actual_layer_height/2)):
-                # Это горизонтальная плоскость на уровне среза или рядом
-                # Проецируем весь треугольник на плоскость
-                vertices_2d = triangle[:, :2]
-                
-                # Преобразуем вершины в пиксели
-                pixels = [to_pixel(v[0], v[1]) for v in vertices_2d]
-                
-                # Рисуем заполненный треугольник
-                draw.polygon(pixels, fill=1)
-                mask_draw.polygon(pixels, fill=1)
-                continue
-            
-            # Обычный случай: треугольник пересекает плоскость
-            if np.max(z_values) < current_z or np.min(z_values) > current_z:
-                continue
-            
-            # Находим точки пересечения треугольника с плоскостью Z
-            intersections = []
-            for i in range(3):
-                p1 = triangle[i]
-                p2 = triangle[(i + 1) % 3]
-                
-                # Проверяем, пересекает ли ребро плоскость Z
-                if (p1[2] >= current_z and p2[2] < current_z) or (p1[2] < current_z and p2[2] >= current_z):
-                    # Вычисляем точку пересечения
-                    t = (current_z - p1[2]) / (p2[2] - p1[2])
-                    x = p1[0] + t * (p2[0] - p1[0])
-                    y = p1[1] + t * (p2[1] - p1[1])
-                    intersections.append((x, y))
-            
-            # Если найдены две точки пересечения, рисуем отрезок
-            if len(intersections) == 2:
-                p1, p2 = intersections
-                pixel1 = to_pixel(p1[0], p1[1])
-                pixel2 = to_pixel(p2[0], p2[1])
-                
-                # Рисуем контур на основном изображении и маске
-                draw.line([pixel1, pixel2], fill=1, width=wall_thickness)
-                mask_draw.line([pixel1, pixel2], fill=1, width=1)
+        # Apply transformations
+        vectors = stl_mesh.vectors.copy()
         
-        # Если есть контур, заполняем его
-        if infill_percent > 0:
-            # Находим точку внутри контура для заливки
-            # Используем центр ограничивающего прямоугольника маски
-            bbox = mask_img.getbbox()
-            if bbox:
-                center_x_mask = (bbox[0] + bbox[2]) // 2
-                center_y_mask = (bbox[1] + bbox[3]) // 2
-                
-                # Заполняем маску
-                ImageDraw.floodfill(mask_img, (center_x_mask, center_y_mask), 1)
-                
-                # Определяем тип заполнения
-                current_infill_type = infill_type
-                current_infill_percent = infill_percent
-                
-                # Используем полную заливку, если это необходимо
-                if use_full_infill:
-                    current_infill_type = "full"
-                    current_infill_percent = 100
-                    print(f"Слой {slice_index+1}/{num_slices} (полная заливка)")
-                else:
-                    print(f"Слой {slice_index+1}/{num_slices} ({infill_type} заполнение)")
-                
-                # Добавляем заполнение
-                add_infill(draw, mask_img, current_infill_type, current_infill_percent, image_size)
+        # Scale
+        vectors *= scale
         
-        # Сохранение среза
-        img.save(os.path.join(output_dir, f"slice_{slice_index:04d}.bmp"))
-    
-    print(f"\nКонвертация завершена! Создано {num_slices} слоев.")
+        # Rotation
+        rx, ry, rz = rotation
+        rx = math.radians(rx)
+        ry = math.radians(ry)
+        rz = math.radians(rz)
+        
+        # Rotation matrices
+        rot_x = np.array([[1, 0, 0],
+                          [0, math.cos(rx), -math.sin(rx)],
+                          [0, math.sin(rx), math.cos(rx)]])
+        
+        rot_y = np.array([[math.cos(ry), 0, math.sin(ry)],
+                          [0, 1, 0],
+                          [-math.sin(ry), 0, math.cos(ry)]])
+        
+        rot_z = np.array([[math.cos(rz), -math.sin(rz), 0],
+                          [math.sin(rz), math.cos(rz), 0],
+                          [0, 0, 1]])
+        
+        # Apply rotation
+        for i in range(len(vectors)):
+            for j in range(3):
+                vectors[i, j] = np.dot(rot_z, np.dot(rot_y, np.dot(rot_x, vectors[i, j])))
+        
+        # Translation
+        vectors += np.array(translation)
+        
+        # Plot the mesh
+        self.mesh_data = mplot3d.art3d.Poly3DCollection(vectors)
+        self.mesh_data.set_edgecolor('k')
+        self.mesh_data.set_facecolor('cyan')
+        self.mesh_data.set_alpha(0.5)
+        self.axes.add_collection3d(self.mesh_data)
+        
+        # Auto scale to the mesh size
+        scale = vectors.flatten()
+        self.axes.auto_scale_xyz(scale, scale, scale)
+        
+        self.draw()
 
-def add_infill(draw, mask, infill_type, infill_percent, image_size):
-    """
-    Добавляет заполнение к изображению на основе маски
-    """
-    width, height = image_size
-    
-    # Определяем шаг заполнения на основе процента
-    max_step = 20
-    step = max(1, int(max_step * (100 - infill_percent) / 100))
-    
-    if infill_type == "lines" or infill_type == "grid45":
-        # Линейное заполнение под углом 45 градусов
-        for i in range(-height, width, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i + height, height))
-    
-    elif infill_type == "grid":
-        # Сетка (два направления линий)
-        for i in range(-height, width, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i + height, height))
-        
-        for i in range(0, width + height, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i - height, height))
-    
-    elif infill_type == "hex":
-        # Шестиугольное заполнение
-        for i in range(-height, width, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i + height, height))
-        
-        for i in range(-height, width, step * 2):
-            draw_line_with_mask(draw, mask, (i + step//2, 0), (i + step//2 + height, height))
-        
-        for i in range(0, width + height, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i - height, height))
-    
-    elif infill_type == "triangles":
-        # Треугольное заполнение
-        for i in range(-height, width, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i + height, height))
-        
-        for i in range(0, width + height, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i - height, height))
-        
-        for i in range(0, width, step):
-            draw_line_with_mask(draw, mask, (i, 0), (i, height))
-    
-    elif infill_type == "octagons":
-        # Восьмиугольники
-        spacing = max(3, int(10 * (100 - infill_percent) / 100))
-        for i in range(0, height, spacing):
-            for j in range(0, width, spacing):
-                if i + spacing < height and j + spacing < width:
-                    # Рисуем восьмиугольник
-                    center_x, center_y = j + spacing//2, i + spacing//2
-                    size = spacing // 2
-                    for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
-                        x = int(center_x + size * np.cos(angle))
-                        y = int(center_y + size * np.sin(angle))
-                        if 0 <= x < width and 0 <= y < height and mask.getpixel((x, y)) == 1:
-                            draw.point((x, y), fill=1)
-    
-    elif infill_type == "squares":
-        # Квадраты
-        spacing = max(2, int(10 * (100 - infill_percent) / 100))
-        for i in range(0, height, spacing):
-            for j in range(0, width, spacing):
-                if i + spacing < height and j + spacing < width and mask.getpixel((j, i)) == 1:
-                    draw.rectangle([j, i, j+spacing, i+spacing], fill=1)
-    
-    elif infill_type == "octet":
-        # Октет
-        spacing = max(2, int(10 * (100 - infill_percent) / 100))
-        for i in range(0, height, spacing):
-            for j in range(0, width, spacing):
-                if i + spacing < height and j + spacing < width:
-                    # Рисуем октетный паттерн
-                    center_x, center_y = j + spacing//2, i + spacing//2
-                    radius = spacing // 3
-                    for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
-                        x = int(center_x + radius * np.cos(angle))
-                        y = int(center_y + radius * np.sin(angle))
-                        if 0 <= x < width and 0 <= y < height and mask.getpixel((x, y)) == 1:
-                            draw.point((x, y), fill=1)
-    
-    elif infill_type == "gyroid":
-        # Гироидный паттерн
-        spacing = max(2, int(10 * (100 - infill_percent) / 100))
-        for i in range(0, height, spacing):
-            for j in range(0, width, spacing):
-                if mask.getpixel((j, i)) == 1:
-                    # Упрощенная версия гироидного паттерна
-                    if (i // spacing + j // spacing) % 2 == 0:
-                        draw.point((j, i), fill=1)
-    
-    elif infill_type == "full":
-        # Полное заполнение
-        for i in range(height):
-            for j in range(width):
-                if mask.getpixel((j, i)) == 1:
-                    draw.point((j, i), fill=1)
+class TransformSettings(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
 
-def draw_line_with_mask(draw, mask, start, end):
-    """
-    Рисует линию только в тех местах, где маска имеет значение 1
-    """
-    width, height = mask.size
-    x0, y0 = start
-    x1, y1 = end
-    
-    # Алгоритм Брезенхема для рисования линии
-    dx = abs(x1 - x0)
-    dy = abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx - dy
-    
-    while True:
-        # Проверяем, находится ли точка в пределах изображения и маски
-        if 0 <= x0 < width and 0 <= y0 < height:
-            if mask.getpixel((x0, y0)) == 1:
-                draw.point((x0, y0), fill=1)
-        
-        if x0 == x1 and y0 == y1:
-            break
-        
-        e2 = 2 * err
-        if e2 > -dy:
-            err -= dy
-            x0 += sx
-        if e2 < dx:
-            err += dx
-            y0 += sy
+    def initUI(self):
+        layout = QVBoxLayout()
 
-def display_menu(current_settings):
-    """
-    Отображает меню с текущими настройками
-    """
-    print("\n" + "="*50)
-    print("      КОНВЕРТЕР STL В BMP СРЕЗЫ")
-    print("="*50)
-    print(f"1. STL файл: {current_settings['stl_path']}")
-    print(f"2. Выходная директория: {current_settings['output_dir']}")
-    print(f"3. Толщина слоя: {current_settings['layer_height']}")
-    print(f"4. Толщина стенки: {current_settings['wall_thickness']}")
-    print(f"5. Процент заполнения: {current_settings['infill_percent']}%")
-    print(f"6. Тип заполнения: {current_settings['infill_type']}")
-    print(f"7. Разрешение изображения: {current_settings['image_size'][0]}x{current_settings['image_size'][1]}")
-    print(f"8. Слои с полной заливкой: {current_settings['solid_layers']}")
-    print("9. Начать конвертацию")
-    print("10. Выход")
-    print("="*50)
+        # Масштаб
+        scale_layout = QHBoxLayout()
+        scale_layout.addWidget(QLabel("Масштаб:"))
+        self.scale = QDoubleSpinBox()
+        self.scale.setRange(0.1, 10.0)
+        self.scale.setValue(1.0)
+        self.scale.setSingleStep(0.1)
+        scale_layout.addWidget(self.scale)
+        layout.addLayout(scale_layout)
 
-def main():
-    """
-    Основная функция с текстовым меню
-    """
-    # Настройки по умолчанию
-    settings = {
-        'stl_path': '',
-        'output_dir': 'output',
-        'layer_height': 0.1,  # Толщина слоя по умолчанию
-        'wall_thickness': 1,
-        'infill_percent': 20,
-        'infill_type': 'grid',
-        'image_size': (320, 240),  # Ширина, высота
-        'solid_layers': 5  # Количество слоев с полной заливкой
-    }
-    
-    # Доступные типы заполнения
-    infill_types = [
-        "full", "grid", "grid45", "hex", "triangles", 
-        "octagons", "squares", "octet", "gyroid"
-    ]
-    
-    while True:
-        display_menu(settings)
-        choice = input("Выберите пункт меню: ")
+        # Положение
+        position_group = QGroupBox("Положение")
+        position_layout = QVBoxLayout()
         
-        if choice == '1':
-            path = input("Введите путь к STL-файлу: ").strip('"')
-            if os.path.isfile(path) and path.lower().endswith('.stl'):
-                settings['stl_path'] = path
-                print("Файл успешно выбран!")
-            else:
-                print("Ошибка: файл не существует или не является STL файлом!")
+        x_layout = QHBoxLayout()
+        x_layout.addWidget(QLabel("X:"))
+        self.x_pos = QDoubleSpinBox()
+        self.x_pos.setRange(-100.0, 100.0)
+        self.x_pos.setValue(0.0)
+        x_layout.addWidget(self.x_pos)
+        position_layout.addLayout(x_layout)
         
-        elif choice == '2':
-            dir_path = input("Введите путь к выходной директории: ").strip('"')
-            if dir_path:
-                settings['output_dir'] = dir_path
-                print("Выходная директория установлена!")
-            else:
-                print("Ошибка: путь не может быть пустым!")
+        y_layout = QHBoxLayout()
+        y_layout.addWidget(QLabel("Y:"))
+        self.y_pos = QDoubleSpinBox()
+        self.y_pos.setRange(-100.0, 100.0)
+        self.y_pos.setValue(0.0)
+        y_layout.addWidget(self.y_pos)
+        position_layout.addLayout(y_layout)
         
-        elif choice == '3':
-            try:
-                height = float(input("Введите толщину слоя: ") or "0.1")
-                if height > 0:
-                    settings['layer_height'] = height
-                    print("Толщина слоя установлена!")
-                else:
-                    print("Ошибка: толщина слоя должна быть положительной!")
-            except ValueError:
-                print("Ошибка: введите число!")
+        z_layout = QHBoxLayout()
+        z_layout.addWidget(QLabel("Z:"))
+        self.z_pos = QDoubleSpinBox()
+        self.z_pos.setRange(-100.0, 100.0)
+        self.z_pos.setValue(0.0)
+        z_layout.addWidget(self.z_pos)
+        position_layout.addLayout(z_layout)
         
-        elif choice == '4':
-            try:
-                thickness = int(input("Введите толщину стенки в пикселях: ") or "1")
-                if thickness > 0:
-                    settings['wall_thickness'] = thickness
-                    print("Толщина стенки установлена!")
-                else:
-                    print("Ошибка: толщина должна быть положительной!")
-            except ValueError:
-                print("Ошибка: введите целое число!")
+        position_group.setLayout(position_layout)
+        layout.addWidget(position_group)
+
+        # Вращение
+        rotation_group = QGroupBox("Вращение (градусы)")
+        rotation_layout = QVBoxLayout()
         
-        elif choice == '5':
-            try:
-                percent = int(input("Введите процент заполнения (0-100): ") or "20")
-                if 0 <= percent <= 100:
-                    settings['infill_percent'] = percent
-                    print("Процент заполнения установлен!")
-                else:
-                    print("Ошибка: процент должен быть между 0 и 100!")
-            except ValueError:
-                print("Ошибка: введите число!")
+        x_rot_layout = QHBoxLayout()
+        x_rot_layout.addWidget(QLabel("X:"))
+        self.x_rot = QDoubleSpinBox()
+        self.x_rot.setRange(-180.0, 180.0)
+        self.x_rot.setValue(0.0)
+        x_rot_layout.addWidget(self.x_rot)
+        rotation_layout.addLayout(x_rot_layout)
         
-        elif choice == '6':
-            print("Доступные типы заполнения:")
-            for i, t in enumerate(infill_types, 1):
-                print(f"{i}. {t}")
+        y_rot_layout = QHBoxLayout()
+        y_rot_layout.addWidget(QLabel("Y:"))
+        self.y_rot = QDoubleSpinBox()
+        self.y_rot.setRange(-180.0, 180.0)
+        self.y_rot.setValue(0.0)
+        y_rot_layout.addWidget(self.y_rot)
+        rotation_layout.addLayout(y_rot_layout)
+        
+        z_rot_layout = QHBoxLayout()
+        z_rot_layout.addWidget(QLabel("Z:"))
+        self.z_rot = QDoubleSpinBox()
+        self.z_rot.setRange(-180.0, 180.0)
+        self.z_rot.setValue(0.0)
+        z_rot_layout.addWidget(self.z_rot)
+        rotation_layout.addLayout(z_rot_layout)
+        
+        rotation_group.setLayout(rotation_layout)
+        layout.addWidget(rotation_group)
+
+        # Кнопка применения трансформации
+        self.apply_btn = QPushButton("Применить трансформацию")
+        layout.addWidget(self.apply_btn)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+class SliceSettings(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+
+        # Толщина слоя
+        layer_thickness = QHBoxLayout()
+        layer_thickness.addWidget(QLabel("Толщина слоя (мм):"))
+        self.layer_thickness = QDoubleSpinBox()
+        self.layer_thickness.setRange(0.01, 1.0)
+        self.layer_thickness.setValue(0.1)
+        self.layer_thickness.setSingleStep(0.01)
+        layer_thickness.addWidget(self.layer_thickness)
+        layout.addLayout(layer_thickness)
+
+        # Толщина стенок
+        wall_thickness = QHBoxLayout()
+        wall_thickness.addWidget(QLabel("Толщина стенок (мм):"))
+        self.wall_thickness = QSpinBox()
+        self.wall_thickness.setRange(1, 10)
+        self.wall_thickness.setValue(2)
+        wall_thickness.addWidget(self.wall_thickness)
+        layout.addLayout(wall_thickness)
+
+        # Подложка
+        self.raft_enable = QCheckBox("Включить подложку")
+        self.raft_enable.setChecked(True)
+        layout.addWidget(self.raft_enable)
+
+        raft_layers = QHBoxLayout()
+        raft_layers.addWidget(QLabel("Количество слоев подложки:"))
+        self.raft_layers = QSpinBox()
+        self.raft_layers.setRange(1, 10)
+        self.raft_layers.setValue(3)
+        raft_layers.addWidget(self.raft_layers)
+        layout.addLayout(raft_layers)
+
+        # Разрешение
+        resolution_group = QGroupBox("Разрешение изображения")
+        resolution_layout = QVBoxLayout()
+        
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(QLabel("Ширина:"))
+        self.width = QSpinBox()
+        self.width.setRange(100, 1000)
+        self.width.setValue(320)
+        res_layout.addWidget(self.width)
+        
+        res_layout.addWidget(QLabel("Высота:"))
+        self.height = QSpinBox()
+        self.height.setRange(100, 1000)
+        self.height.setValue(240)
+        res_layout.addWidget(self.height)
+        
+        resolution_layout.addLayout(res_layout)
+        resolution_group.setLayout(resolution_layout)
+        layout.addWidget(resolution_group)
+
+        # Путь сохранения
+        save_path_layout = QHBoxLayout()
+        save_path_layout.addWidget(QLabel("Папка для сохранения:"))
+        self.save_path = QLineEdit()
+        self.save_path.setText(os.getcwd())
+        save_path_layout.addWidget(self.save_path)
+        
+        self.browse_btn = QPushButton("Обзор")
+        save_path_layout.addWidget(self.browse_btn)
+        layout.addLayout(save_path_layout)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+class FillSettings(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+
+        # Тип заполнения
+        fill_type = QHBoxLayout()
+        fill_type.addWidget(QLabel("Тип заполнения:"))
+        self.fill_type = QComboBox()
+        self.fill_type.addItems(["Полное", "Сетка", "Восьмиугольники", "Квадраты", "Треугольники", "Гироид"])
+        fill_type.addWidget(self.fill_type)
+        layout.addLayout(fill_type)
+
+        # Плотность заполнения
+        fill_density = QHBoxLayout()
+        fill_density.addWidget(QLabel("Плотность заполнения (%):"))
+        self.fill_density = QSpinBox()
+        self.fill_density.setRange(0, 100)
+        self.fill_density.setValue(20)
+        fill_density.addWidget(self.fill_density)
+        layout.addLayout(fill_density)
+
+        # Размер паттерна
+        pattern_size = QHBoxLayout()
+        pattern_size.addWidget(QLabel("Размер паттерна (мм):"))
+        self.pattern_size = QDoubleSpinBox()
+        self.pattern_size.setRange(1.0, 10.0)
+        self.pattern_size.setValue(5.0)
+        self.pattern_size.setSingleStep(0.5)
+        pattern_size.addWidget(self.pattern_size)
+        layout.addLayout(pattern_size)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+class SupportSettings(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+
+    def initUI(self):
+        layout = QVBoxLayout()
+
+        # Включение поддержек
+        self.support_enable = QCheckBox("Включить поддержки")
+        layout.addWidget(self.support_enable)
+
+        # Угол поддержек
+        support_angle = QHBoxLayout()
+        support_angle.addWidget(QLabel("Угол поддержек (градусы):"))
+        self.support_angle = QSpinBox()
+        self.support_angle.setRange(0, 90)
+        self.support_angle.setValue(45)
+        support_angle.addWidget(self.support_angle)
+        layout.addLayout(support_angle)
+
+        # Тип поддержек
+        support_type = QHBoxLayout()
+        support_type.addWidget(QLabel("Тип поддержек:"))
+        self.support_type = QComboBox()
+        self.support_type.addItems(["Обычные", "Древовидные"])
+        support_type.addWidget(self.support_type)
+        layout.addLayout(support_type)
+
+        # Плотность поддержек
+        support_density = QHBoxLayout()
+        support_density.addWidget(QLabel("Плотность поддержек (%):"))
+        self.support_density = QSpinBox()
+        self.support_density.setRange(5, 50)
+        self.support_density.setValue(15)
+        support_density.addWidget(self.support_density)
+        layout.addLayout(support_density)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+class STLConverter:
+    def __init__(self):
+        self.mesh = None
+        self.transformed_mesh = None
+        
+    def load_mesh(self, file_path):
+        self.mesh = mesh.Mesh.from_file(file_path)
+        self.transformed_mesh = self.mesh
+        return self.mesh
+        
+    def apply_transformations(self, scale, rotation, translation):
+        if self.mesh is None:
+            return None
             
-            try:
-                type_choice = int(input("Выберите тип заполнения: "))
-                if 1 <= type_choice <= len(infill_types):
-                    settings['infill_type'] = infill_types[type_choice-1]
-                    print("Тип заполнения установлен!")
-                else:
-                    print("Ошибка: неверный выбор!")
-            except ValueError:
-                print("Ошибка: введите число!")
+        # Создаем копию меша для трансформаций
+        self.transformed_mesh = mesh.Mesh(self.mesh.data.copy())
         
-        elif choice == '7':
-            try:
-                width = int(input("Введите ширину изображения: ") or "320")
-                height = int(input("Введите высоту изображения: ") or "240")
-                if width > 0 and height > 0:
-                    settings['image_size'] = (width, height)
-                    print("Разрешение установлено!")
-                else:
-                    print("Ошибка: разрешение должно быть положительным!")
-            except ValueError:
-                print("Ошибка: введите числа!")
+        # Масштабирование
+        self.transformed_mesh.vectors *= scale
         
-        elif choice == '8':
-            try:
-                solid_layers = int(input("Введите количество слоев с полной заливкой: ") or "5")
-                if solid_layers >= 0:
-                    settings['solid_layers'] = solid_layers
-                    print("Количество слоев с полной заливкой установлено!")
-                else:
-                    print("Ошибка: количество слоев должно быть неотрицательным!")
-            except ValueError:
-                print("Ошибка: введите целое число!")
+        # Вращение
+        rx, ry, rz = rotation
+        rx = math.radians(rx)
+        ry = math.radians(ry)
+        rz = math.radians(rz)
         
-        elif choice == '9':
-            if not settings['stl_path']:
-                print("Ошибка: сначала выберите STL файл!")
-                continue
+        # Матрицы вращения
+        rot_x = np.array([[1, 0, 0],
+                          [0, math.cos(rx), -math.sin(rx)],
+                          [0, math.sin(rx), math.cos(rx)]])
+        
+        rot_y = np.array([[math.cos(ry), 0, math.sin(ry)],
+                          [0, 1, 0],
+                          [-math.sin(ry), 0, math.cos(ry)]])
+        
+        rot_z = np.array([[math.cos(rz), -math.sin(rz), 0],
+                          [math.sin(rz), math.cos(rz), 0],
+                          [0, 0, 1]])
+        
+        # Применяем вращение к каждой точке
+        for i in range(len(self.transformed_mesh.vectors)):
+            for j in range(3):
+                vec = self.transformed_mesh.vectors[i, j]
+                vec = np.dot(rot_z, np.dot(rot_y, np.dot(rot_x, vec)))
+                self.transformed_mesh.vectors[i, j] = vec
+        
+        # Перенос
+        self.transformed_mesh.vectors += np.array(translation)
+        
+        return self.transformed_mesh
+        
+    def slice(self, layer_height, width, height, fill_type, fill_density, pattern_size, 
+              support_enable=False, support_angle=45, support_type="Обычные", support_density=15):
+        if self.transformed_mesh is None:
+            return []
             
-            print("\nНачинаю конвертацию...")
-            stl_to_bmp_slices(
-                settings['stl_path'], 
-                settings['output_dir'], 
-                layer_height=settings['layer_height'],
-                wall_thickness=settings['wall_thickness'],
-                infill_percent=settings['infill_percent'],
-                infill_type=settings['infill_type'],
-                image_size=settings['image_size'],
-                solid_layers=settings['solid_layers']
+        # Находим границы модели
+        min_z = np.min(self.transformed_mesh.vectors[:, :, 2])
+        max_z = np.max(self.transformed_mesh.vectors[:, :, 2])
+        
+        # Генерируем слои
+        layers = []
+        z = min_z
+        
+        while z <= max_z:
+            # Получаем контуры для текущего слоя
+            contours = self._get_contours(z)
+            
+            # Создаем изображение слоя
+            layer_img = Image.new('1', (width, height), 0)
+            draw = ImageDraw.Draw(layer_img)
+            
+            # Рисуем контуры
+            for contour in contours:
+                # Масштабируем и переносим контур в центр изображения
+                scaled_contour = []
+                for point in contour:
+                    x = int((point[0] + width/2) * 0.9)
+                    y = int((point[1] + height/2) * 0.9)
+                    scaled_contour.append((x, y))
+                
+                if len(scaled_contour) >= 3:
+                    draw.polygon(scaled_contour, fill=1, outline=1)
+            
+            # Применяем заполнение
+            if fill_density > 0:
+                self._apply_fill_pattern(layer_img, fill_type, fill_density, pattern_size)
+            
+            layers.append(layer_img)
+            z += layer_height
+            
+        return layers
+        
+    def _get_contours(self, z):
+        # Упрощенная реализация получения контуров
+        # В реальном приложении нужно использовать более сложный алгоритм
+        contours = []
+        
+        for triangle in self.transformed_mesh.vectors:
+            points_below = []
+            points_above = []
+            
+            for point in triangle:
+                if point[2] <= z:
+                    points_below.append(point)
+                else:
+                    points_above.append(point)
+            
+            # Если треугольник пересекает плоскость Z
+            if len(points_below) == 2 and len(points_above) == 1:
+                # Находим точки пересечения
+                p1, p2 = points_below
+                p3 = points_above[0]
+                
+                # Интерполируем точки пересечения
+                t1 = (z - p1[2]) / (p3[2] - p1[2])
+                x1 = p1[0] + t1 * (p3[0] - p1[0])
+                y1 = p1[1] + t1 * (p3[1] - p1[1])
+                
+                t2 = (z - p2[2]) / (p3[2] - p2[2])
+                x2 = p2[0] + t2 * (p3[0] - p2[0])
+                y2 = p2[1] + t2 * (p3[1] - p2[1])
+                
+                contours.append([(x1, y1), (x2, y2)])
+            
+            elif len(points_below) == 1 and len(points_above) == 2:
+                # Аналогично предыдущему случаю, но наоборот
+                p1 = points_below[0]
+                p2, p3 = points_above
+                
+                t1 = (z - p1[2]) / (p2[2] - p1[2])
+                x1 = p1[0] + t1 * (p2[0] - p1[0])
+                y1 = p1[1] + t1 * (p2[1] - p1[1])
+                
+                t2 = (z - p1[2]) / (p3[2] - p1[2])
+                x2 = p1[0] + t2 * (p3[0] - p1[0])
+                y2 = p1[1] + t2 * (p3[1] - p1[1])
+                
+                contours.append([(x1, y1), (x2, y2)])
+        
+        # Объединяем сегменты в замкнутые контуры
+        # (упрощенная реализация - в реальном приложении нужен более сложный алгоритм)
+        closed_contours = []
+        while contours:
+            current = contours.pop(0)
+            found_match = True
+            
+            while found_match and len(current) < 20:  # ограничение для избежания бесконечного цикла
+                found_match = False
+                for i, contour in enumerate(contours):
+                    if abs(current[-1][0] - contour[0][0]) < 0.1 and abs(current[-1][1] - contour[0][1]) < 0.1:
+                        current.extend(contour[1:])
+                        contours.pop(i)
+                        found_match = True
+                        break
+                    elif abs(current[-1][0] - contour[-1][0]) < 0.1 and abs(current[-1][1] - contour[-1][1]) < 0.1:
+                        current.extend(reversed(contour[:-1]))
+                        contours.pop(i)
+                        found_match = True
+                        break
+            
+            if len(current) > 2 and abs(current[0][0] - current[-1][0]) < 0.1 and abs(current[0][1] - current[-1][1]) < 0.1:
+                closed_contours.append(current)
+        
+        return closed_contours
+        
+    def _apply_fill_pattern(self, image, pattern_type, density, pattern_size):
+        # Преобразуем изображение в массив numpy
+        img_array = np.array(image)
+        
+        if pattern_type == "Полное":
+            # Уже заполнено полностью
+            pass
+        elif pattern_type == "Сетка":
+            # Создаем сетку линий
+            h, w = img_array.shape
+            step = int(pattern_size * (100 / density))
+            
+            for i in range(0, h, step):
+                cv2.line(img_array, (0, i), (w, i), 1, 1)
+            
+            for i in range(0, w, step):
+                cv2.line(img_array, (i, 0), (i, h), 1, 1)
+        elif pattern_type == "Восьмиугольники":
+            # Реализация восьмиугольников
+            h, w = img_array.shape
+            step = int(pattern_size * (100 / density))
+            
+            for y in range(0, h, step):
+                for x in range(0, w, step):
+                    if x + step < w and y + step < h:
+                        pts = np.array([
+                            [x + step//4, y],
+                            [x + 3*step//4, y],
+                            [x + step, y + step//4],
+                            [x + step, y + 3*step//4],
+                            [x + 3*step//4, y + step],
+                            [x + step//4, y + step],
+                            [x, y + 3*step//4],
+                            [x, y + step//4]
+                        ], np.int32)
+                        cv2.fillPoly(img_array, [pts], 1)
+        # Другие паттерны можно добавить аналогично
+        
+        # Обновляем изображение
+        image.paste(Image.fromarray(img_array))
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.stl_mesh = None
+        self.converter = STLConverter()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("STL to BMP Slicer")
+        self.setGeometry(100, 100, 1200, 800)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QHBoxLayout()
+
+        # Левая панель с настройками
+        left_panel = QWidget()
+        left_panel.setMaximumWidth(400)
+        left_layout = QVBoxLayout()
+
+        # Кнопка загрузки STL
+        self.load_btn = QPushButton("Загрузить STL файл")
+        self.load_btn.clicked.connect(self.load_stl)
+        left_layout.addWidget(self.load_btn)
+
+        # Настройки слайсинга
+        self.tabs = QTabWidget()
+        self.transform_settings = TransformSettings()
+        self.slice_settings = SliceSettings()
+        self.fill_settings = FillSettings()
+        self.support_settings = SupportSettings()
+
+        self.tabs.addTab(self.transform_settings, "Трансформация")
+        self.tabs.addTab(self.slice_settings, "Слайсинг")
+        self.tabs.addTab(self.fill_settings, "Заполнение")
+        self.tabs.addTab(self.support_settings, "Поддержки")
+        left_layout.addWidget(self.tabs)
+
+        # Кнопка генерации
+        self.generate_btn = QPushButton("Генерировать BMP")
+        self.generate_btn.clicked.connect(self.generate_bmp)
+        left_layout.addWidget(self.generate_btn)
+
+        # Кнопка применения трансформации
+        self.transform_settings.apply_btn.clicked.connect(self.apply_transformation)
+
+        # Кнопка выбора папки сохранения
+        self.slice_settings.browse_btn.clicked.connect(self.browse_save_path)
+
+        left_panel.setLayout(left_layout)
+        main_layout.addWidget(left_panel)
+
+        # Правая панель с визуализацией
+        right_panel = QWidget()
+        right_layout = QVBoxLayout()
+        
+        # Визуализация 3D модели
+        self.model_viewer = ModelViewer(self)
+        right_layout.addWidget(self.model_viewer)
+        
+        # Превью слоя
+        preview_label = QLabel("Превью слоя:")
+        right_layout.addWidget(preview_label)
+        
+        self.preview = QLabel()
+        self.preview.setMinimumSize(320, 240)
+        self.preview.setStyleSheet("border: 1px solid black; background-color: white;")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setText("Превью будет здесь")
+        right_layout.addWidget(self.preview)
+        
+        right_panel.setLayout(right_layout)
+        main_layout.addWidget(right_panel)
+
+        central_widget.setLayout(main_layout)
+
+    def load_stl(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Выберите STL файл", "", "STL Files (*.stl)")
+        if file_path:
+            try:
+                self.stl_mesh = self.converter.load_mesh(file_path)
+                self.model_viewer.plot_mesh(self.stl_mesh)
+                QMessageBox.information(self, "Успех", "STL файл успешно загружен")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить STL файл: {str(e)}")
+
+    def apply_transformation(self):
+        if self.stl_mesh is None:
+            QMessageBox.warning(self, "Ошибка", "Сначала загрузите STL файл")
+            return
+
+        try:
+            scale = self.transform_settings.scale.value()
+            rotation = (
+                self.transform_settings.x_rot.value(),
+                self.transform_settings.y_rot.value(),
+                self.transform_settings.z_rot.value()
+            )
+            translation = (
+                self.transform_settings.x_pos.value(),
+                self.transform_settings.y_pos.value(),
+                self.transform_settings.z_pos.value()
             )
             
-            print(f"Файлы сохранены в директории '{settings['output_dir']}'")
-            input("Нажмите Enter для продолжения...")
-        
-        elif choice == '10':
-            print("Выход из программы...")
-            break
-        
-        else:
-            print("Неверный выбор! Попробуйте снова.")
+            transformed_mesh = self.converter.apply_transformations(scale, rotation, translation)
+            self.model_viewer.plot_mesh(transformed_mesh)
+            QMessageBox.information(self, "Успех", "Трансформация применена")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при трансформации: {str(e)}")
 
-if __name__ == "__main__":
-    main()
+    def browse_save_path(self):
+        folder_path = QFileDialog.getExistingDirectory(self, "Выберите папку для сохранения")
+        if folder_path:
+            self.slice_settings.save_path.setText(folder_path)
+
+    def generate_bmp(self):
+        if self.stl_mesh is None:
+            QMessageBox.warning(self, "Ошибка", "Сначала загрузите STL файл")
+            return
+
+        # Получение параметров
+        layer_height = self.slice_settings.layer_thickness.value()
+        width = self.slice_settings.width.value()
+        height = self.slice_settings.height.value()
+        fill_type = self.fill_settings.fill_type.currentText()
+        fill_density = self.fill_settings.fill_density.value()
+        pattern_size = self.fill_settings.pattern_size.value()
+        
+        support_enable = self.support_settings.support_enable.isChecked()
+        support_angle = self.support_settings.support_angle.value()
+        support_type = self.support_settings.support_type.currentText()
+        support_density = self.support_settings.support_density.value()
+        
+        save_path = self.slice_settings.save_path.text()
+
+        # Здесь должна быть реализована логика слайсинга и генерации изображений
+        try:
+            layers = self.converter.slice(
+                layer_height, width, height, fill_type, fill_density, pattern_size,
+                support_enable, support_angle, support_type, support_density
+            )
+            
+            # Сохранение изображений
+            for i, layer_img in enumerate(layers):
+                layer_img.save(os.path.join(save_path, f"layer_{i:04d}.bmp"))
+            
+            # Показ превью первого слоя
+            if layers:
+                preview_img = layers[0].resize((320, 240), Image.NEAREST)
+                preview_img = preview_img.convert("RGB")
+                data = preview_img.tobytes("raw", "RGB")
+                q_img = QImage(data, preview_img.width, preview_img.height, QImage.Format_RGB888)
+                self.preview.setPixmap(QPixmap.fromImage(q_img))
+            
+            QMessageBox.information(self, "Успех", f"BMP файлы успешно сгенерированы и сохранены в {save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при генерации: {str(e)}")
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
